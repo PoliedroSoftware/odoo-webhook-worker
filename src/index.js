@@ -22,9 +22,26 @@ export default {
       const tokenFromHeader = request.headers.get("x-webhook-token");
       const token = tokenFromQuery || tokenFromHeader;
 
+      console.log("Debug token:");
+      console.log(JSON.stringify({
+        tokenPresent: !!token,
+        tokenLength: token ? token.length : 0,
+        secretConfigured: !!env.WEBHOOK_SECRET,
+        secretLength: env.WEBHOOK_SECRET ? env.WEBHOOK_SECRET.length : 0,
+        matches: token === env.WEBHOOK_SECRET
+      }, null, 2));
+
       if (token !== env.WEBHOOK_SECRET) {
         console.warn("Intento no autorizado");
-        return json({ ok: false, error: "Unauthorized" }, 401);
+
+        return json({
+          ok: false,
+          error: "Unauthorized",
+          tokenPresent: !!token,
+          tokenLength: token ? token.length : 0,
+          secretConfigured: !!env.WEBHOOK_SECRET,
+          secretLength: env.WEBHOOK_SECRET ? env.WEBHOOK_SECRET.length : 0
+        }, 401);
       }
 
       const body = await request.json();
@@ -32,36 +49,23 @@ export default {
       console.log("Webhook recibido desde Odoo:");
       console.log(JSON.stringify(body, null, 2));
 
-      let result;
-
-      if (body._model === "account.move") {
-        result = await processInvoiceWebhook(body, env);
-      } else if (body._model === "pos.order") {
-        result = await processPosWebhook(body, env);
-      } else {
-        result = {
-          event_type: "unknown",
-          message: "Modelo no reconocido",
-          source_model: body._model || null,
-          original_payload: body
-        };
-      }
-
-      console.log("Resultado procesado:");
-      console.log(JSON.stringify(result, null, 2));
-
-      // Opcional: reenviar a tu API interna
-      if (env.DESTINATION_API_URL) {
-        ctx.waitUntil(forwardToDestination(result, env));
-      }
+      /*
+        IMPORTANTE:
+        Respondemos rápido a Odoo para evitar que Odoo cierre la conexión.
+        El procesamiento pesado queda en segundo plano con ctx.waitUntil().
+      */
+      ctx.waitUntil(handleWebhookInBackground(body, env));
 
       return json({
         ok: true,
-        processed: result
+        message: "Webhook recibido. Procesamiento iniciado en segundo plano.",
+        model: body._model || null,
+        id: body.id || body._id || null,
+        received_at: new Date().toISOString()
       });
 
     } catch (error) {
-      console.error("Error procesando webhook:");
+      console.error("Error recibiendo webhook:");
       console.error(error.message);
       console.error(error.stack);
 
@@ -72,6 +76,41 @@ export default {
     }
   }
 };
+
+async function handleWebhookInBackground(body, env) {
+  try {
+    console.log("Procesamiento en segundo plano iniciado:");
+    console.log(JSON.stringify(body, null, 2));
+
+    let result;
+
+    if (body._model === "account.move") {
+      result = await processInvoiceWebhook(body, env);
+    } else if (body._model === "pos.order") {
+      result = await processPosWebhook(body, env);
+    } else {
+      result = {
+        event_type: "unknown",
+        message: "Modelo no reconocido",
+        source_model: body._model || null,
+        original_payload: body,
+        processed_at: new Date().toISOString()
+      };
+    }
+
+    console.log("Resultado procesado en segundo plano:");
+    console.log(JSON.stringify(result, null, 2));
+
+    if (env.DESTINATION_API_URL) {
+      await forwardToDestination(result, env);
+    }
+
+  } catch (error) {
+    console.error("Error procesando webhook en segundo plano:");
+    console.error(error.message);
+    console.error(error.stack);
+  }
+}
 
 async function processInvoiceWebhook(body, env) {
   const invoiceNumber = body.name || body.display_name;
@@ -209,7 +248,6 @@ async function processPosWebhook(body, env) {
         "id",
         "order_id",
         "product_id",
-        "full_product_name",
         "name",
         "qty",
         "price_unit",
@@ -253,6 +291,13 @@ async function processPosWebhook(body, env) {
 async function authenticateOdoo(env) {
   console.log("Autenticando contra Odoo...");
 
+  validateRequiredEnv(env, [
+    "ODOO_URL",
+    "ODOO_DB",
+    "ODOO_USERNAME",
+    "ODOO_API_KEY"
+  ]);
+
   const uid = await odooJsonRpc(env, "common", "authenticate", [
     env.ODOO_DB,
     env.ODOO_USERNAME,
@@ -284,10 +329,6 @@ async function executeKw(env, uid, model, method, args = [], kwargs = {}) {
 }
 
 async function odooJsonRpc(env, service, method, args) {
-  if (!env.ODOO_URL) {
-    throw new Error("Falta variable ODOO_URL");
-  }
-
   const baseUrl = env.ODOO_URL.replace(/\/$/, "");
   const endpoint = `${baseUrl}/jsonrpc`;
 
@@ -354,6 +395,15 @@ async function forwardToDestination(payload, env) {
   } catch (error) {
     console.error("Error en forwardToDestination:");
     console.error(error.message);
+    console.error(error.stack);
+  }
+}
+
+function validateRequiredEnv(env, names) {
+  const missing = names.filter((name) => !env[name]);
+
+  if (missing.length > 0) {
+    throw new Error(`Faltan variables de entorno: ${missing.join(", ")}`);
   }
 }
 
